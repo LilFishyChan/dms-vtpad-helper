@@ -52,7 +52,6 @@
 
 struct pad {
     int fd;                    // uinput 触控板 fd，-1 = 没建设备
-    int kbd_fd;                // uinput 修饰键键盘 fd，跟触控板同生共死
     int w;                     // 面板逻辑宽（像素）
     int h;                     // 面板逻辑高（像素）
     double px_per_mm;          // 屏幕 DPI（逻辑像素 / 毫米）
@@ -119,79 +118,31 @@ static void abs_setup(int fd, int code, int min, int max, int resolution) {
         logmsg("UI_ABS_SETUP code=%d failed: %s", code, strerror(errno));
 }
 
-// 修饰键键盘：触控板的 BTN_LEFT 本身带不了修饰键，必须由**键盘设备**先把
-// Super/Shift 按下，合成器才会把那个点击算成 Super+Click。
-// 触控板设备上发 KEY_* 没用 —— libinput 的 touchpad dispatch 只认 BTN_TOOL_*/BTN_LEFT/RIGHT，
-// 其它 KEY 一律忽略，不会送到合成器。
-static int create_keyboard(void) {
-    int fd = open("/dev/uinput", O_WRONLY | O_NONBLOCK);
-    if (fd < 0) {
-        logmsg("open /dev/uinput for keyboard failed: %s", strerror(errno));
-        return -1;
-    }
-
-    ioctl(fd, UI_SET_EVBIT, EV_KEY);
-    // 声明整段标准键位（0x01..0xff）：修饰键、字母数字、功能键、方向键、编辑键都在里面。
-    // 只声明 4 个修饰键的话，普通按键还是得走 ydotool —— 那条路每次 25ms，
-    // 而且没法「按住不放让系统自己重复」。
-    for (int k = 1; k < 256; k++)
-        ioctl(fd, UI_SET_KEYBIT, k);
-
-    struct uinput_setup setup;
-    memset(&setup, 0, sizeof(setup));
-    setup.id.bustype = BUS_VIRTUAL;
-    setup.id.vendor = 0x1209;
-    setup.id.product = 0x0002;
-    setup.id.version = 0x0001;
-    snprintf(setup.name, UINPUT_MAX_NAME_SIZE, "%s Modifiers", DEVICE_NAME);
-
-    if (ioctl(fd, UI_DEV_SETUP, &setup) < 0 || ioctl(fd, UI_DEV_CREATE) < 0) {
-        logmsg("keyboard UI_DEV_SETUP/CREATE failed: %s", strerror(errno));
-        close(fd);
-        return -1;
-    }
-
-    logmsg("modifier keyboard created");
-    return fd;
-}
-
-// 销毁设备：fd 关掉内核即回收，不需要别的清理
+// 销毁触控板设备：fd 关掉内核即回收，不需要别的清理。
+// 键盘注入不归这个 helper 管（走 ydotool），这里没有第二个设备要收拾。
 static void destroy_device(struct pad *p) {
-    if (p->fd >= 0) {
-        // 兜底把按着的东西松开，免得下游以为还按着
-        for (int i = 0; i < MAX_SLOTS; i++) {
-            if (!p->slot_active[i])
-                continue;
+    if (p->fd < 0)
+        return;
 
-            emit(p->fd, EV_ABS, ABS_MT_SLOT, i);
-            emit(p->fd, EV_ABS, ABS_MT_TRACKING_ID, -1);
-            p->slot_active[i] = false;
-        }
-        if (p->down_count > 0) {
-            emit(p->fd, EV_KEY, BTN_TOOL_FINGER, 0);
-            emit(p->fd, EV_KEY, BTN_TOOL_DOUBLETAP, 0);
-            p->down_count = 0;
-        }
-        syn(p->fd);
+    for (int i = 0; i < MAX_SLOTS; i++) {
+        if (!p->slot_active[i])
+            continue;
 
-        ioctl(p->fd, UI_DEV_DESTROY);
-        close(p->fd);
-        p->fd = -1;
+        emit(p->fd, EV_ABS, ABS_MT_SLOT, i);
+        emit(p->fd, EV_ABS, ABS_MT_TRACKING_ID, -1);
+        p->slot_active[i] = false;
     }
-
-    if (p->kbd_fd >= 0) {
-        // 别把修饰键留在按下状态里
-        const int mods[] = {KEY_LEFTCTRL, KEY_LEFTSHIFT, KEY_LEFTALT, KEY_LEFTMETA};
-        for (size_t i = 0; i < sizeof(mods) / sizeof(mods[0]); i++)
-            emit(p->kbd_fd, EV_KEY, mods[i], 0);
-        syn(p->kbd_fd);
-
-        ioctl(p->kbd_fd, UI_DEV_DESTROY);
-        close(p->kbd_fd);
-        p->kbd_fd = -1;
+    if (p->down_count > 0) {
+        emit(p->fd, EV_KEY, BTN_TOOL_FINGER, 0);
+        emit(p->fd, EV_KEY, BTN_TOOL_DOUBLETAP, 0);
+        p->down_count = 0;
     }
+    syn(p->fd);
 
-    logmsg("device destroyed");
+    ioctl(p->fd, UI_DEV_DESTROY);
+    close(p->fd);
+    p->fd = -1;
+    logmsg("touchpad device destroyed");
 }
 
 static int create_device(struct pad *p, int w, int h, double px_per_mm) {
@@ -272,8 +223,6 @@ static int create_device(struct pad *p, int w, int h, double px_per_mm) {
     logmsg("device created: %dx%d px, %.2f px/mm -> %dx%d units, res=%d, physical %.1fx%.1f mm",
            w, h, px_per_mm, abs_w, abs_h, res, w / px_per_mm, h / px_per_mm);
 
-    // 修饰键键盘跟触控板同生共死：没有键盘就发不出 Super+Click
-    p->kbd_fd = create_keyboard();
     return 0;
 }
 
@@ -424,24 +373,10 @@ static int handle_line(struct pad *p, char *line, int client_fd) {
         return 1;
     }
 
-    // 键盘事件（修饰键和普通按键都走这里）。
-    // 修饰键用 "mod"、普通键用 "key"，实现完全一样 —— 分开只是为了日志好读。
-    // 必须是独立的键盘设备：触控板设备上的 KEY_* 会被 libinput 丢掉。
-    if (strcmp(cmd, "key") == 0 || strcmp(cmd, "mod") == 0) {
-        int code = 0, down = 0;
-        if (sscanf(rest, "%d %d", &code, &down) != 2)
-            return -1;
-        if (p->kbd_fd >= 0) {
-            emit(p->kbd_fd, EV_KEY, code, down ? 1 : 0);
-            syn(p->kbd_fd);
-        }
-        logmsg("%s %d %d", cmd, code, down);
-        return 1;
-    }
-
     // bye：只销毁设备、不关连接。切走触控板页时用 —— socket 留着给键盘按键注入用，
     // 但没必要一直挂着一个指针设备在系统里。
     if (strcmp(cmd, "bye") == 0) {
+        // 只撤触控板设备：键盘设备必须留着，否则切回键盘页后按键注入全失效
         destroy_device(p);
         return 1;
     }
@@ -589,7 +524,6 @@ int main(int argc, char **argv) {
     struct pad p;
     memset(&p, 0, sizeof(p));
     p.fd = -1;
-    p.kbd_fd = -1;   // memset 出来的 0 是 stdin，必须显式设 -1
 
     if (socket_alive(path)) {
         logmsg("another instance is already serving %s", path);
