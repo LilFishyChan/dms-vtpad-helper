@@ -1,0 +1,4 @@
+dms-vtpad-helper
+vtpadctl
+build/
+*.o
